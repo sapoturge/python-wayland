@@ -52,6 +52,8 @@ class Display(WaylandObject):
         self.shm = None
         self.seat = None
         self.outputs = []
+        self.subcompositor = None
+        self.data_device_manager = None
         self.registry = self.get_registry()
         self.dispatch()
         self.roundtrip()
@@ -232,7 +234,7 @@ class Registry(WaylandObject):
         given version of the given interface.
         
         """
-        if interface in ("wl_compositor", "wl_shell", "wl_shm", "wl_seat", "wl_output"):
+        if interface in ("wl_compositor", "wl_shell", "wl_shm", "wl_seat", "wl_output", "wl_subcompositor", "wl_data_device_manager"):
             new_id = self.display.next_id()
             self.display.out_queue.append((self.pack_arguments(0, name, interface, version, new_id), ()))
             self.global_objects[name] = new_id
@@ -246,6 +248,10 @@ class Registry(WaylandObject):
                 self.display.seat = Seat(self.display, new_id)
             elif interface == "wl_output":
                 self.display.outputs.append(Output(self.display, new_id))
+            elif interface == "wl_subcompositor":
+                self.display.subcompositor = Subcompositor(self.display, new_id)
+            elif interface == "wl_data_device_manager":
+                self.display.data_device_manager = DataDeviceManager(self.display, new_id)
         else:
             print(interface)
 
@@ -691,6 +697,14 @@ class DataOffer(WaylandObject):
         """
         pass
 
+    def unpack_event(self, op, data, fds):
+        if op == 0:
+            length = struct.unpack("I", data[:4])[0]
+            mime = data[4:4+length].decode("utf-8")
+            return self, op, (mime,)
+        elif op == 1 or op == 2:
+            return self, op, struct.unpack("I", data)
+
     events = ['offer', 'source_actions', 'action']
     requests = ['accept', 'receive', 'destroy', 'finish', 'set_actions']
 
@@ -846,6 +860,24 @@ class DataSource(WaylandObject):
         """
         pass
 
+    def unpack_event(self, op, data, fds):
+        if op == 0:
+            length = struct.unpack("I", data[:4])[0]
+            mime = data[4:length].decode("utf-8")
+            return self, op, (mime,)
+        elif op == 1:
+            length = struct.unpack("I", data[:4])[0]
+            mime = data[4:length].decode("utf-8")
+            return self, op, (mime, fds.pop(0))
+        elif op == 2:
+            return self, op, ()
+        elif op == 3:
+            return self, op, ()
+        elif op == 4:
+            return self, op, ()
+        elif op == 5:
+            return self, op, struct.unpack("I", data)
+
     events = ['target', 'send', 'cancelled', 'dnd_drop_performed', 'dnd_finished', 'action']
     requests = ['offer', 'destroy', 'set_actions']
 
@@ -898,7 +930,7 @@ class DataDevice(WaylandObject):
         """
         self.display.out_queue.append((self.pack_arguments(1, source, serial), ()))
 
-    def handle_data_offer(self, id):
+    def handle_data_offer(self, offer):
         """ introduce a new wl_data_offer
         
         The data_offer event introduces a new wl_data_offer object,
@@ -912,7 +944,7 @@ class DataDevice(WaylandObject):
         """
         pass
 
-    def handle_enter(self, serial, surface, x, y, id):
+    def handle_enter(self, serial, surface, x, y, offer):
         """ initiate drag-and-drop session
         
         This event is sent when an active drag-and-drop pointer enters
@@ -989,6 +1021,25 @@ class DataDevice(WaylandObject):
         
         """
         self.display.out_queue.append((self.pack_arguments(2), ()))
+
+    def unpack_event(self, op, data, fds):
+        if op == 0:
+            return self, op, (DataOffer(self.display, struct.unpack("I", data)[0]),)
+        elif op == 1:
+            serial, s, x, y, o = struct.unpack("IIIII", data)
+            surface = self.display.objects[s]
+            offer = self.display.objects[o]
+            return self, op, (serial, surface, x/256, y/256, offer)
+        elif op == 2:
+            return self, op, ()
+        elif op == 3:
+            t, x, y = struct.unpack("III", data)
+            return self, op, (t, x/256, y/256)
+        elif op == 4:
+            return self, op, ()
+        elif op == 5:
+            offer = struct.unpack("I", data)[0]
+            return self, op, (self.display.objects[offer])
 
     events = ['data_offer', 'enter', 'leave', 'motion', 'drop', 'selection']
     requests = ['start_drag', 'set_selection', 'release']

@@ -3,14 +3,14 @@ import tempfile
 
 import numpy
 
-from repo.wayland import client
+from wayland import client
 
 
 class Snake(object):
     WHITE = (255, 255, 255, 255)
-    BLACK = (0, 0, 0)
-    RED = (255, 0, 0)
-    GREEN = (0, 255, 0)
+    BLACK = (0, 0, 0, 255)
+    RED = (0, 0, 255, 255)
+    GREEN = (0, 255, 0, 255)
 
     UP, DOWN, LEFT, RIGHT = 0, 1, 2, 3
 
@@ -71,9 +71,9 @@ class Snake(object):
             else:
                 self.snake = self.snake[:-1]
             self.pixels.fill(32)
-            self.pixels[self.apple[1]*10:self.apple[1]*10+10, self.apple[0]*10:self.apple[0]*10+10, 2] = 255
+            self.pixels[self.apple[1]*10:self.apple[1]*10+10, self.apple[0]*10:self.apple[0]*10+10] = self.RED
             for x, y in self.snake:
-                self.pixels[y*10:y*10+10, x*10:x*10+10, 1] = 255
+                self.pixels[y*10:y*10+10, x*10:x*10+10] = self.GREEN
             self.surface.attach(self.buffer, 0, 0)
             self.surface.damage(0, 0, self.width*10, self.height*10)
             self.last_time = time
@@ -95,12 +95,12 @@ class Snake(object):
                 self.quit()
 
     def setup_wayland(self):
-        self.display = client.Display()
-        compositor = None
-        shell = None
-        seat = None
-        shm = None
-        for obj in self.display.objects.values():
+        self.display = client.Display("wayland-0")
+        compositor = self.display.globals["wl_compositor"]
+        shell = self.display.globals["wl_shell"]
+        seat = self.display.globals["wl_seat"]
+        shm = self.display.globals["wl_shm"]
+        '''for obj in self.display.objects.values():
             if isinstance(obj, client.Seat):
                 seat = obj
             elif isinstance(obj, client.Shm):
@@ -116,8 +116,8 @@ class Snake(object):
         elif seat is None:
             raise Exception("No Input seat")
         elif shm is None:
-            raise Exception("Shared Memory is unavailible")
-        elif shm.XRGB8888 not in shm.availible:
+            raise Exception("Shared Memory is unavailible")'''
+        if shm.XRGB8888 not in shm.availible:
             raise Exception("Shared Memory Format is unavailible")
         self.surface = compositor.create_surface()
         shell_surface = shell.get_shell_surface(self.surface)

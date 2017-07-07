@@ -5,7 +5,6 @@ class WaylandObject(object):
     def __init__(self, display, obj_id):
         self.display = display
         self.obj_id = obj_id
-        self.display.objects[obj_id] = self
 
     def unpack_event(self, op, data, fds):
         return self, op, data
@@ -17,6 +16,8 @@ class WaylandObject(object):
                 argument = argument.obj_id
             if isinstance(argument, int):
                 message += struct.pack("i", argument)
+            elif isinstance(argument, float):
+                message += struct.pack("i", int(argument*256))
             elif isinstance(argument, str):
                 message += struct.pack("I", len(argument) + 1)
                 message += argument.encode("utf-8")
@@ -27,6 +28,8 @@ class WaylandObject(object):
                 message += b"\x00\x00\x00\x00"
         length = (len(message) + 8) << 16
         return struct.pack("II", self.obj_id, length + opcode) + message
+
+    pack_arguments.base = True
 
     def convert_name(self):
         name = "wl" + self.__class__.__name__

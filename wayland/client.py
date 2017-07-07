@@ -34,26 +34,23 @@ from .base import WaylandObject
 
 
 class Display(WaylandObject):
-    def __init__(self):
+    def __init__(self, display="wayland-0", *custom_globals):
+        known_globals = (Compositor, Shell, Shm, Seat, Output, Subcompositor, DataDeviceManager) + custom_globals
+        self.global_templates = {c.interface: c for c in known_globals}
         self.connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM, 0)
-        path = os.path.join(os.getenv("XDG_RUNTIME_DIR"), "wayland-0")
+        path = os.path.join(os.getenv("XDG_RUNTIME_DIR"), display)
         self.connection.connect(path)
         self.connected = True
         self.open_ids = []
         self.ids = iter(range(1, 0xffffffff))
-        self.objects = {}
         WaylandObject.__init__(self, self, self.next_id())
+        self.objects = {self.obj_id: self}
+        self.dead_objects = []
         self.out_queue = []
         self.event_queue = []
         self.incoming_fds = []
         self.previous_data = ""
-        self.compositor = None
-        self.shell = None
-        self.shm = None
-        self.seat = None
-        self.outputs = []
-        self.subcompositor = None
-        self.data_device_manager = None
+        self.globals = {}
         self.registry = self.get_registry()
         self.dispatch()
         self.roundtrip()
@@ -100,6 +97,9 @@ class Display(WaylandObject):
 
             if len(data) < size:
                 break
+            if obj_id in self.dead_objects:
+                data = data[size:]
+                continue
             obj = self.objects.get(obj_id, None)
             if obj is not None:
                 event = obj.unpack_event(op, data[8:size], self.incoming_fds)
@@ -108,7 +108,7 @@ class Display(WaylandObject):
                 self.event_queue.append(event)
                 data = data[size:]
             else:
-                print("Error: No Data")
+                raise IOError("Error: Bad object: {} {}".format(obj_id, self.objects))
         self.previous_data = data
 
     def flush(self):
@@ -167,6 +167,7 @@ class Display(WaylandObject):
         """
         new_id = self.display.next_id()
         callback = Callback(self.display, new_id)
+        self.objects[new_id] = callback
         self.display.out_queue.append((self.pack_arguments(0, new_id), ()))
         return callback
 
@@ -180,6 +181,7 @@ class Display(WaylandObject):
         """
         new_id = self.display.next_id()
         registry = Registry(self.display, new_id)
+        self.objects[new_id] = registry
         self.display.out_queue.append((self.pack_arguments(1, new_id), ()))
         return registry
 
@@ -202,7 +204,7 @@ class Display(WaylandObject):
     INVALID_METHOD = 1
     NO_MEMORY = 2
 
-    def handle_delete_id(self, id):
+    def handle_delete_id(self, obj):
         """ acknowledge object ID deletion
         
         This event is used internally by the object ID management
@@ -212,7 +214,13 @@ class Display(WaylandObject):
         safely reuse the object ID.
         
         """
-        pass
+        if obj in self.objects:
+            self.remove_object(obj)
+        self.dead_objects.remove(obj)
+        del self.objects[obj]
+
+    def remove_object(self, obj):
+        self.dead_objects.append(obj)
 
     events = ['error', 'delete_id']
     requests = ['sync', 'get_registry']
@@ -234,24 +242,18 @@ class Registry(WaylandObject):
         given version of the given interface.
         
         """
-        if interface in ("wl_compositor", "wl_shell", "wl_shm", "wl_seat", "wl_output", "wl_subcompositor", "wl_data_device_manager"):
+        if interface in self.display.global_templates:
             new_id = self.display.next_id()
             self.display.out_queue.append((self.pack_arguments(0, name, interface, version, new_id), ()))
             self.global_objects[name] = new_id
-            if interface == "wl_compositor":
-                self.display.compositor = Compositor(self.display, new_id)
-            elif interface == "wl_shell":
-                self.display.shell = Shell(self.display, new_id)
-            elif interface == "wl_shm":
-                self.display.shm = Shm(self.display, new_id)
-            elif interface == "wl_seat":
-                self.display.seat = Seat(self.display, new_id)
-            elif interface == "wl_output":
-                self.display.outputs.append(Output(self.display, new_id))
-            elif interface == "wl_subcompositor":
-                self.display.subcompositor = Subcompositor(self.display, new_id)
-            elif interface == "wl_data_device_manager":
-                self.display.data_device_manager = DataDeviceManager(self.display, new_id)
+            obj = self.display.global_templates[interface](self.display, new_id)
+            if interface in self.display.globals:
+                if isinstance(self.display.globals[interface], self.display.global_templates[interface]):
+                    self.display.globals[interface] = [self.display.globals[interface]]
+                self.display.globals[interface].append(obj)
+            else:
+                self.display.globals[interface] = obj
+            self.display.objects[new_id] = obj
         else:
             print(interface)
 
@@ -270,7 +272,18 @@ class Registry(WaylandObject):
         the global going away and a client sending a request to it.
         
         """
-        pass
+        if name not in self.global_objects:
+            return
+        id_num = self.global_objects[name]
+        obj = self.display.objects[id_num]
+        if obj.interface in self.display.globals:
+            if self.display.globals[obj.interface] is not obj:
+                self.display.globals[obj.interface].remove(obj)
+                if len(self.display.globals[obj.interface]) == 1:
+                    self.display.globals[obj.interface] = self.display.globals[obj.interface][0]
+            else:
+                del self.display.globals[obj.interface]
+        self.display.remove_obj(id_num)
 
     def unpack_event(self, op, data, fds):
         if op == 0:
@@ -304,6 +317,7 @@ class Callback(WaylandObject):
 
 
 class Compositor(WaylandObject):
+    interface = "wl_compositor"
 
     def create_surface(self):
         """ create new surface
@@ -313,6 +327,7 @@ class Compositor(WaylandObject):
         """
         new_id = self.display.next_id()
         surface = Surface(self.display, new_id)
+        self.display.objects[new_id] = surface
         self.display.out_queue.append((self.pack_arguments(0, new_id), ()))
         return surface
 
@@ -324,6 +339,7 @@ class Compositor(WaylandObject):
         """
         new_id = self.display.next_id()
         region = Region(self.display, new_id)
+        self.display.objects[new_id] = region
         self.display.out_queue.append((self.pack_arguments(1, new_id), ()))
         return region
 
@@ -351,6 +367,7 @@ class ShmPool(WaylandObject):
         """
         new_id = self.display.next_id()
         buffer = Buffer(self.display, new_id)
+        self.display.objects[new_id] = buffer
         self.display.out_queue.append((self.pack_arguments(0, new_id, offset, width, height, stride, format), ()))
         return buffer
 
@@ -365,6 +382,7 @@ class ShmPool(WaylandObject):
         
         """
         self.display.out_queue.append((self.pack_arguments(1), ()))
+        self.display.remove_object(self.obj_id)
 
     def resize(self, size):
         """ change the size of the pool mapping
@@ -382,6 +400,7 @@ class ShmPool(WaylandObject):
 
 
 class Shm(WaylandObject):
+    interface = "wl_shm"
 
     # wl_shm error values
     INVALID_FORMAT = 0
@@ -464,6 +483,7 @@ class Shm(WaylandObject):
         """
         new_id = self.display.next_id()
         shm_pool = ShmPool(self.display, new_id)
+        self.display.objects[new_id] = shm_pool
         self.display.out_queue.append((self.pack_arguments(0, new_id, size), (fd,)))
         return shm_pool
 
@@ -499,6 +519,7 @@ class Buffer(WaylandObject):
         
         """
         self.display.out_queue.append((self.pack_arguments(0), ()))
+        self.display.remove_object(self.obj_id)
 
     def handle_release(self):
         """ compositor releases buffer
@@ -579,6 +600,7 @@ class DataOffer(WaylandObject):
         
         """
         self.display.out_queue.append((self.pack_arguments(2), ()))
+        self.display.remove_object(self.obj_id)
 
     def handle_offer(self, mime_type):
         """ advertise offered mime type
@@ -730,6 +752,7 @@ class DataSource(WaylandObject):
         
         """
         self.display.out_queue.append((self.pack_arguments(1), ()))
+        self.display.remove_object(self.obj_id)
 
     def handle_target(self, mime_type):
         """ a target accepts an offered mime type
@@ -1024,7 +1047,9 @@ class DataDevice(WaylandObject):
 
     def unpack_event(self, op, data, fds):
         if op == 0:
-            return self, op, (DataOffer(self.display, struct.unpack("I", data)[0]),)
+            data_offer = DataOffer(self.display, struct.unpack("I", data)[0])
+            self.display.objects[data_offer.obj_id] = data_offer
+            return self, op, (data_offer,)
         elif op == 1:
             serial, s, x, y, o = struct.unpack("IIIII", data)
             surface = self.display.objects[s]
@@ -1046,6 +1071,7 @@ class DataDevice(WaylandObject):
 
 
 class DataDeviceManager(WaylandObject):
+    interface = "wl_data_device_manager"
 
     def create_data_source(self):
         """ create a new data source
@@ -1055,6 +1081,7 @@ class DataDeviceManager(WaylandObject):
         """
         new_id = self.display.next_id()
         data_source = DataSource(self.display, new_id)
+        self.display.objects[new_id] = data_source
         self.display.out_queue.append((self.pack_arguments(0, new_id), ()))
         return data_source
 
@@ -1066,6 +1093,7 @@ class DataDeviceManager(WaylandObject):
         """
         new_id = self.display.next_id()
         data_device = DataDevice(self.display, new_id)
+        self.display.objects[new_id] = data_device
         self.display.out_queue.append((self.pack_arguments(1, new_id, seat), ()))
         return data_device
 
@@ -1080,6 +1108,8 @@ class DataDeviceManager(WaylandObject):
 
 
 class Shell(WaylandObject):
+    interface = "wl_shell"
+
     ROLE = 0
 
     def get_shell_surface(self, surface):
@@ -1094,6 +1124,7 @@ class Shell(WaylandObject):
         """
         new_id = self.display.next_id()
         shell_surface = ShellSurface(self.display, new_id)
+        self.display.objects[new_id] = shell_surface
         self.display.out_queue.append((self.pack_arguments(0, new_id, surface), ()))
         return shell_surface
 
@@ -1369,6 +1400,7 @@ class Surface(WaylandObject):
         
         """
         self.display.out_queue.append((self.pack_arguments(0), ()))
+        self.display.remove_object(self.obj_id)
 
     def attach(self, buffer, x, y):
         """ set the surface contents
@@ -1484,6 +1516,7 @@ class Surface(WaylandObject):
         """
         new_id = self.display.next_id()
         callback = Callback(self.display, new_id)
+        self.display.objects[new_id] = callback
         self.display.out_queue.append((self.pack_arguments(3, new_id), ()))
         return callback
 
@@ -1706,6 +1739,7 @@ class Surface(WaylandObject):
 
 
 class Seat(WaylandObject):
+    interface = "wl_seat"
 
     # seat capability bitmask
     POINTER = 1
@@ -1777,6 +1811,7 @@ class Seat(WaylandObject):
         """
         new_id = self.display.next_id()
         pointer = Pointer(self.display, new_id, self)
+        self.display.objects[new_id] = pointer
         self.display.out_queue.append((self.pack_arguments(0, new_id), ()))
         return pointer
 
@@ -1794,6 +1829,7 @@ class Seat(WaylandObject):
         """
         new_id = self.display.next_id()
         keyboard = Keyboard(self.display, new_id, self)
+        self.display.objects[new_id] = keyboard
         self.display.out_queue.append((self.pack_arguments(1, new_id), ()))
         return keyboard
 
@@ -1811,6 +1847,7 @@ class Seat(WaylandObject):
         """
         new_id = self.display.next_id()
         touch = Touch(self.display, new_id, self)
+        self.display.objects[new_id] = touch
         self.display.out_queue.append((self.pack_arguments(2, new_id), ()))
         return touch
 
@@ -1917,7 +1954,8 @@ class Pointer(WaylandObject):
         an appropriate pointer image with the set_cursor request.
         
         """
-        self.seat.handle_enter(serial, surface, surface_x, surface_y)
+        real_surface = self.display.objects[surface]
+        self.seat.handle_enter(serial, real_surface, surface_x, surface_y)
 
     def handle_leave(self, serial, surface):
         """ leave event
@@ -1929,7 +1967,8 @@ class Pointer(WaylandObject):
         for the new focus.
         
         """
-        self.seat.handle_leave(serial, surface)
+        real_surface = self.display.objects[surface]
+        self.seat.handle_leave(serial, real_surface)
 
     def handle_motion(self, time, surface_x, surface_y):
         """ pointer motion event
@@ -2232,7 +2271,13 @@ class Keyboard(WaylandObject):
         key = self.keys[key + self.minimum]
         max_modifiers = len(bin(len(key))) - 2
         abs_modifiers = 2 ** max_modifiers - 1
-        keysym = key[self.modifiers & abs_modifiers]
+        mod_index = self.modifiers & abs_modifiers
+        new_mod_index = mod_index
+        i = 1
+        while new_mod_index >= len(key):
+            new_mod_index = mod_index & abs_modifiers - i
+            i += 1
+        keysym = key[new_mod_index]
         self.seat.handle_key(serial, time, keysym, state)
 
     def handle_modifiers(self, serial, mods_depressed, mods_latched, mods_locked, group):
@@ -2455,6 +2500,7 @@ class Touch(WaylandObject):
 
 
 class Output(WaylandObject):
+    interface = "wl_output"
 
     # subpixel geometry information
     UNKNOWN = 0
@@ -2584,6 +2630,7 @@ class Region(WaylandObject):
         
         """
         self.display.out_queue.append((self.pack_arguments(0), ()))
+        self.display.remove_object(self.obj_id)
 
     def add(self, x, y, width, height):
         """ add rectangle to region
@@ -2606,6 +2653,7 @@ class Region(WaylandObject):
 
 
 class Subcompositor(WaylandObject):
+    interface = "wl_subcompositor"
 
     def destroy(self):
         """ unbind from the subcompositor interface
@@ -2616,6 +2664,8 @@ class Subcompositor(WaylandObject):
         
         """
         self.display.out_queue.append((self.pack_arguments(0), ()))
+        self.display.remove_object(self.obj_id)
+
     BAD_SURFACE = 0
 
     def get_subsurface(self, surface, parent):
@@ -2632,6 +2682,7 @@ class Subcompositor(WaylandObject):
         """
         new_id = self.display.next_id()
         subsurface = Subsurface(self.display, new_id)
+        self.display.objects[new_id] = subsurface
         self.display.out_queue.append((self.pack_arguments(1, new_id, surface, parent), ()))
         return subsurface
 
@@ -2652,6 +2703,8 @@ class Subsurface(WaylandObject):
         
         """
         self.display.out_queue.append((self.pack_arguments(0), ()))
+        self.display.remove_object(self.obj_id)
+
     BAD_SURFACE = 0
 
     def set_position(self, x, y):

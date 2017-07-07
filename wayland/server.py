@@ -38,8 +38,8 @@ from .base import WaylandObject
 
 
 class Display(object):
-    def __init__(self):
-        self.global_objects = [Compositor(self, 2)]
+    def __init__(self, *global_objects):
+        self.global_objects = global_objects
         self.server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         if os.getenv("XDG_RUNTIME_DIR") is None:
             os.putenv("XDG_RUNTIME_DIR", "/tmp")
@@ -55,12 +55,19 @@ class Display(object):
         self.connections = []
 
     def handle_requests(self):
-        active, *_ = select.select(self.connections + [self.server], [], [], 0)
+        connections = [c.connection for c in self.clients] + [self.server]
+        active, *_ = select.select(connections, [], [], 0)
         for a in active:
             if a is self.server:
-                connection = a.accept()[0]
+                print("Accepted")
+                connection = self.server.accept()[0]
                 self.connections.append(connection)
                 self.clients.append(Client(self, connection))
+            else:
+                self.clients[connections.index(a)].dispatch()
+        for c in self.clients:
+            if c.out_queue:
+                c.flush()
 
 
 class Client(WaylandObject):
@@ -70,12 +77,13 @@ class Client(WaylandObject):
         self.open_ids = []
         self.current_serial = 0
         self.ids = iter(range(1, 0xffffffff))
-        self.objects = {}
         WaylandObject.__init__(self, self, self.next_id())
+        self.objects = {self.obj_id: self}
         self.out_queue = []
         self.event_queue = []
         self.incoming_fds = []
         self.previous_data = ""
+        self.alive = True
 
     def next_id(self):
         if self.open_ids:
@@ -84,8 +92,9 @@ class Client(WaylandObject):
 
     def dispatch(self):
         self.flush()
-        self.recv()
-        self.dispatch_pending()
+        if self.alive:
+            self.recv()
+        # self.dispatch_pending()
 
     def dispatch_pending(self):
         while self.event_queue:
@@ -106,7 +115,11 @@ class Client(WaylandObject):
         except socket.error as e:
             if e.errno == 11:
                 return
-            raise
+            elif e.errno == 32:
+                for o in self.objects:
+                    self.objects[o].destroy()
+            else:
+                raise
 
     def decode(self, data):
         if self.previous_data:
@@ -120,13 +133,17 @@ class Client(WaylandObject):
                 break
             obj = self.objects.get(obj_id, None)
             if obj is not None:
-                event = obj.unpack_event(op, data[8:size], self.incoming_fds)
-                if event is None:
-                    print(obj, op)
-                self.event_queue.append(event)
+                args = obj.unpack_event(op, data[8:size], self.incoming_fds)
+                if isinstance(args, bytes):
+                    print("Unhandled event: {} #{}".format(obj, op))
+                elif hasattr(obj.unpack_event, "base"):
+                    print("Unhandled event: {} all".format(obj, op))
+                else:
+                    method_name = "handle_" + obj.events[op]
+                    getattr(obj, method_name)(*args)
                 data = data[size:]
             else:
-                print("Error: No Data")
+                raise Exception("Error: Bad Object {} ({})".format(obj_id, self.objects))
         self.previous_data = data
 
     def flush(self):
@@ -141,17 +158,18 @@ class Client(WaylandObject):
             except socket.error as e:
                 if e.errno == 11:
                     self.out_queue.insert(0, (data, fds))
-                    break
-                raise
+                elif e.errno == 32:
+                    for o in self.objects:
+                        self.objects[o].destroy()
+                else:
+                    raise
 
     def unpack_event(self, op, data, fds):
         if op == 0:
-            object_id, code, length = struct.unpack("III", data[:12])
-            message = data[12:length+11].decode("utf-8")
-            return self, op, (object_id, code, message)
+            return struct.unpack("I", data)
         elif op == 1:
             object_id = struct.unpack("I", data)
-            return self, op, object_id
+            return object_id
 
     def disconnect(self):
         self.connection.close()
@@ -221,6 +239,12 @@ class Client(WaylandObject):
         del self.objects[obj_id]
         self.display.out_queue.append((self.pack_arguments(1, obj_id), ()))
 
+    def destroy(self):
+        self.connection.close()
+        self.real_display.connections.remove(self.connection)
+        self.real_display.clients.remove(self)
+        self.alive = False
+
     events = ['sync', 'get_registry']
     requests = ['error', 'delete_id']
 
@@ -228,8 +252,8 @@ class Client(WaylandObject):
 class Registry(WaylandObject):
     def __init__(self, display, obj_id):
         WaylandObject.__init__(self, display, obj_id)
-        for i, o in enumerate(self.display.real_display.objects):
-            self.send_global(i, o.convert_name(), o.version)
+        for i, o in enumerate(self.display.real_display.global_objects):
+            self.send_global(i, o.name, o.version)
 
     def handle_bind(self, name, obj_id):
         """ bind an object to the display
@@ -238,7 +262,24 @@ class Registry(WaylandObject):
         specified name as the identifier.
         
         """
-        self.display.objects[obj_id] = self.display.real_display.objects[name]
+        real = self.display.real_display.global_objects[name]
+        if real.name == "wl_compositor":
+            proxy = CompositorProxy
+        elif real.name == "wl_data_device_manager":
+            proxy = DataDeviceManagerProxy
+        elif real.name == "wl_shm":
+            proxy = ShmProxy
+        elif real.name == "wl_output":
+            proxy = OutputProxy
+        elif real.name == "wl_shell":
+            proxy = ShellProxy
+        elif real.name == "wl_seat":
+            proxy = SeatProxy
+        elif real.name == "wl_subcompositor":
+            proxy = SubcompositorProxy
+        else:
+            return
+        self.display.objects[obj_id] = proxy(self.display, obj_id, real)
 
     def send_global(self, name, interface, version):
         """ announce global object
@@ -269,6 +310,16 @@ class Registry(WaylandObject):
         """
         self.display.out_queue.append((self.pack_arguments(1, name), ()))
 
+    def unpack_event(self, opcode, data, fds):
+        name, interface_length = struct.unpack("II", data[:8])
+        import math
+        interface_length = math.ceil(interface_length / 4) * 4
+        version, obj_id = struct.unpack("II", data[8+interface_length:16+interface_length])
+        return name, obj_id
+
+    def destroy(self):
+        pass
+
     events = ['bind']
     requests = ['global', 'global_remove']
 
@@ -283,12 +334,20 @@ class Callback(WaylandObject):
         """
         self.display.out_queue.append((self.pack_arguments(0, callback_data), ()))
 
+    def destroy(self):
+        pass
+
     events = []
     requests = ['done']
 
 
-class Compositor(WaylandObject):
+class CompositorProxy(WaylandObject):
     version = 4
+
+    def __init__(self, display, obj_id, compositor):
+        super().__init__(display, obj_id)
+        self.compositor = compositor
+        self.compositor.setup(self)
 
     def handle_create_surface(self, obj_id):
         """ create new surface
@@ -296,7 +355,7 @@ class Compositor(WaylandObject):
         Ask the compositor to create a new surface.
         
         """
-        self.display.objects[obj_id] = Surface(self.display, obj_id)
+        self.compositor.create_surface(self, obj_id)
 
     def handle_create_region(self, obj_id):
         """ create new region
@@ -304,16 +363,21 @@ class Compositor(WaylandObject):
         Ask the compositor to create a new region.
         
         """
-        self.display.objects[obj_id] = Region(self.display, obj_id)
+        self.compositor.create_region(self, obj_id)
+
+    def unpack_event(self, op, data, fds):
+        return struct.unpack("I", data)
+
+    def destroy(self):
+        self.compositor.destroy(self)
 
     events = ['create_surface', 'create_region']
     requests = []
 
 
 class ShmPool(WaylandObject):
-    def __init__(self, display, obj_id, fd, size):
+    def __init__(self, display, obj_id):
         WaylandObject.__init__(self, display, obj_id)
-        self.data = mmap.mmap(fd, size)
 
     def handle_create_buffer(self, id, offset, width, height, stride, format):
         """ create a buffer from the pool
@@ -331,7 +395,7 @@ class ShmPool(WaylandObject):
         a buffer from it.
         
         """
-        pass
+        raise NotImplementedError("ShmPool: Create Buffer")
 
     def handle_destroy(self):
         """ destroy the pool
@@ -343,7 +407,7 @@ class ShmPool(WaylandObject):
         are gone.
         
         """
-        pass
+        raise NotImplementedError("ShmPool: Destroy")
 
     def handle_resize(self, size):
         """ change the size of the pool mapping
@@ -354,13 +418,23 @@ class ShmPool(WaylandObject):
         used to make the pool bigger.
         
         """
-        pass
+        raise NotImplementedError("ShmPool: Resize")
+
+    def unpack_event(self, op, data, fds):
+        if op == 0:
+            return struct.unpack("IIIIII", data)
+        elif op == 2:
+            return struct.unpack("I", data)
+        return super().unpack_event(op, data, fds)[2]
+
+    def destroy(self):
+        self.handle_destroy()
 
     events = ['create_buffer', 'destroy', 'resize']
     requests = []
 
 
-class Shm(WaylandObject):
+class ShmProxy(WaylandObject):
     version = 1
 
     # wl_shm error values
@@ -428,6 +502,11 @@ class Shm(WaylandObject):
     YUV444 = 0x34325559
     YVU444 = 0x34325659
 
+    def __init__(self, display, obj_id, shm):
+        super().__init__(display, obj_id)
+        self.shm = shm
+        self.shm.setup(self)
+
     def handle_create_pool(self, id, fd, size):
         """ create a shm pool
         
@@ -438,7 +517,7 @@ class Shm(WaylandObject):
         descriptor, to use as backing memory for the pool.
         
         """
-        pass
+        self.shm.create_pool(self, id, fd, size)
 
     def send_format(self, format):
         """ pixel format description
@@ -449,6 +528,13 @@ class Shm(WaylandObject):
         
         """
         self.display.out_queue.append((self.pack_arguments(0, format), ()))
+
+    def unpack_event(self, op, data, fds):
+        pool_id, size = struct.unpack("II", data)
+        return pool_id, fds.pop(0), size
+
+    def destroy(self):
+        self.shm.destroy(self)
 
     events = ['create_pool']
     requests = ['format']
@@ -465,7 +551,7 @@ class Buffer(WaylandObject):
         For possible side-effects to a surface, see wl_surface.attach.
         
         """
-        pass
+        raise NotImplementedError("Buffer: Destroy")
 
     def send_release(self):
         """ compositor releases buffer
@@ -485,6 +571,12 @@ class Buffer(WaylandObject):
         
         """
         self.display.out_queue.append((self.pack_arguments(0), ()))
+
+    def unpack_event(self, op, data, fds):
+        return super().unpack_event(op, data, fds)[2]
+
+    def destroy(self):
+        self.handle_destroy()
 
     events = ['destroy']
     requests = ['release']
@@ -515,7 +607,7 @@ class DataOffer(WaylandObject):
         conjunction with wl_data_source.action for feedback.
         
         """
-        pass
+        raise NotImplementedError("DataOffer: Accept")
 
     def handle_receive(self, mime_type, fd):
         """ request that the data is transferred
@@ -537,7 +629,7 @@ class DataOffer(WaylandObject):
         determine acceptance.
         
         """
-        pass
+        raise NotImplementedError("DataOffer: Recieve")
 
     def handle_destroy(self):
         """ destroy data offer
@@ -545,7 +637,7 @@ class DataOffer(WaylandObject):
         Destroy the data offer.
         
         """
-        pass
+        raise NotImplementedError("DataOffer: Destroy")
 
     def send_offer(self, mime_type):
         """ advertise offered mime type
@@ -572,7 +664,8 @@ class DataOffer(WaylandObject):
         wl_data_offer.action.
         
         """
-        pass
+        raise NotImplementedError("DataOffer: Finish")
+
 
     def handle_set_actions(self, dnd_actions, preferred_action):
         """ set the available/preferred drag-and-drop actions
@@ -610,7 +703,7 @@ class DataOffer(WaylandObject):
         will be raised otherwise.
         
         """
-        pass
+        raise NotImplementedError("DataOffer: Set Actions")
 
     def send_source_actions(self, source_actions):
         """ notify the source-side available actions
@@ -664,6 +757,12 @@ class DataOffer(WaylandObject):
         """
         self.display.out_queue.append((self.pack_arguments(2, dnd_action), ()))
 
+    def unpack_event(self, op, data, fds):
+        return super().unpack_event(op, data, fds)[2]
+
+    def destroy(self):
+        self.handle_destroy()
+
     events = ['accept', 'receive', 'destroy', 'finish', 'set_actions']
     requests = ['offer', 'source_actions', 'action']
 
@@ -680,7 +779,7 @@ class DataSource(WaylandObject):
         multiple types.
         
         """
-        pass
+        raise NotImplementedError("DataSource: Offer")
 
     def handle_destroy(self):
         """ destroy the data source
@@ -688,7 +787,7 @@ class DataSource(WaylandObject):
         Destroy the data source.
         
         """
-        pass
+        raise NotImplementedError("DataSource: Destroy")
 
     def send_target(self, mime_type):
         """ a target accepts an offered mime type
@@ -756,7 +855,7 @@ class DataSource(WaylandObject):
         for drag-and-drop will raise a protocol error.
         
         """
-        pass
+        raise NotImplementedError("DataSource: Set Actions")
 
     def send_dnd_drop_performed(self):
         """ the drag-and-drop operation physically finished
@@ -819,6 +918,12 @@ class DataSource(WaylandObject):
         """
         self.display.out_queue.append((self.pack_arguments(5, dnd_action), ()))
 
+    def unpack_event(self, op, data, fds):
+        return super().unpack_event(op, data, fds)[2]
+
+    def destroy(self):
+        self.handle_destroy()
+
     events = ['offer', 'destroy', 'set_actions']
     requests = ['target', 'send', 'cancelled', 'dnd_drop_performed', 'dnd_finished', 'action']
 
@@ -858,7 +963,7 @@ class DataDevice(WaylandObject):
         undefined, and the wl_surface is unmapped.
         
         """
-        pass
+        raise NotImplementedError("DataDevice: Start Drag")
 
     def handle_set_selection(self, source, serial):
         """ copy data to the selection
@@ -869,7 +974,7 @@ class DataDevice(WaylandObject):
         To unset the selection, set the source to NULL.
         
         """
-        pass
+        raise NotImplementedError("DataDevice: Set Selection")
 
     def send_data_offer(self):
         """ introduce a new wl_data_offer
@@ -964,13 +1069,24 @@ class DataDevice(WaylandObject):
         This request destroys the data device.
         
         """
+        raise NotImplementedError("DataDevice: Release")
+
+    def unpack_event(self, op, data, fds):
+        return super().unpack_event(op, data, fds)[2]
+
+    def destroy(self):
         pass
 
     events = ['start_drag', 'set_selection', 'release']
     requests = ['data_offer', 'enter', 'leave', 'motion', 'drop', 'selection']
 
 
-class DataDeviceManager(WaylandObject):
+class DataDeviceManagerProxy(WaylandObject):
+
+    def __init__(self, display, obj_id, data_device_manager):
+        super().__init__(display, obj_id)
+        self.data_device_manager = data_device_manager
+        self.data_device_manager.setup(self)
 
     def handle_create_data_source(self, id):
         """ create a new data source
@@ -978,7 +1094,7 @@ class DataDeviceManager(WaylandObject):
         Create a new data source.
         
         """
-        pass
+        self.data_device_manager.create_data_source(self, id)
 
     def handle_get_data_device(self, id, seat):
         """ create a new data device
@@ -986,7 +1102,7 @@ class DataDeviceManager(WaylandObject):
         Create a new data device for a given seat.
         
         """
-        pass
+        self.data_device_manager.get_data_device(self, id, seat)
 
     # drag and drop actions
     NONE = 0
@@ -994,14 +1110,25 @@ class DataDeviceManager(WaylandObject):
     MOVE = 2
     ASK = 4
 
+    def unpack_event(self, op, data, fds):
+        return super().unpack_event(op, data, fds)[2]
+
+    def destroy(self):
+        self.data_device_manager.destroy(self)
+
     events = ['create_data_source', 'get_data_device']
     requests = []
 
 
-class Shell(WaylandObject):
+class ShellProxy(WaylandObject):
     version = 1
 
     ROLE = 0
+
+    def __init__(self, display, obj_id, shell):
+        super().__init__(display, obj_id)
+        self.shell = shell
+        self.shell.setup(self)
 
     def handle_get_shell_surface(self, id, surface):
         """ create a shell surface from a surface
@@ -1013,7 +1140,13 @@ class Shell(WaylandObject):
         Only one shell surface can be associated with a given surface.
         
         """
-        pass
+        self.shell.get_shell_surface(self, id, surface)
+
+    def unpack_event(self, op, data, fds):
+        return struct.unpack("II", data)
+
+    def destroy(self):
+        self.shell.destroy(self)
 
     events = ['get_shell_surface']
     requests = []
@@ -1028,7 +1161,7 @@ class ShellSurface(WaylandObject):
         the client may be deemed unresponsive.
         
         """
-        pass
+        raise NotImplementedError("ShellSurface: Pong")
 
     def handle_move(self, seat, serial):
         """ start an interactive move
@@ -1040,7 +1173,7 @@ class ShellSurface(WaylandObject):
         the surface (e.g. fullscreen or maximized).
         
         """
-        pass
+        raise NotImplementedError("ShellSurface: Move")
 
     # edge values for resizing
     NONE = 0
@@ -1063,7 +1196,7 @@ class ShellSurface(WaylandObject):
         the surface (e.g. fullscreen or maximized).
         
         """
-        pass
+        raise NotImplementedError("ShellSurface: Resize")
 
     def handle_set_toplevel(self):
         """ make the surface a toplevel surface
@@ -1073,7 +1206,7 @@ class ShellSurface(WaylandObject):
         A toplevel surface is not fullscreen, maximized or transient.
         
         """
-        pass
+        raise NotImplementedError("ShellSurface: Set Toplevel")
 
     # details of transient behaviour
     INACTIVE = 0x1
@@ -1090,7 +1223,7 @@ class ShellSurface(WaylandObject):
         The flags argument controls details of the transient behaviour.
         
         """
-        pass
+        raise NotImplementedError("ShellSurface: Set Transient")
 
     # different method to set the surface fullscreen
     DEFAULT = 0
@@ -1136,7 +1269,7 @@ class ShellSurface(WaylandObject):
         be made fullscreen.
         
         """
-        pass
+        raise NotImplementedError("ShellSurface: Set Fullscreen")
 
     def handle_set_popup(self, seat, serial, parent, x, y, flags):
         """ make the surface a popup surface
@@ -1162,7 +1295,7 @@ class ShellSurface(WaylandObject):
         parent surface, in surface-local coordinates.
         
         """
-        pass
+        raise NotImplementedError("ShellSurface: Set Popup")
 
     def handle_set_maximized(self, output):
         """ make the surface a maximized surface
@@ -1187,7 +1320,7 @@ class ShellSurface(WaylandObject):
         The details depend on the compositor implementation.
         
         """
-        pass
+        raise NotImplementedError("ShellSurface: Set Maximized")
 
     def handle_set_title(self, title):
         """ set surface title
@@ -1201,7 +1334,7 @@ class ShellSurface(WaylandObject):
         The string must be encoded in UTF-8.
         
         """
-        pass
+        raise NotImplementedError("ShellSurface: Set Title")
 
     def handle_set_class(self, class_):
         """ set surface class
@@ -1214,7 +1347,7 @@ class ShellSurface(WaylandObject):
         the application's .desktop file as the class.
         
         """
-        pass
+        raise NotImplementedError("ShellSurface: Set Class")
 
     def send_ping(self, serial):
         """ ping client
@@ -1259,6 +1392,18 @@ class ShellSurface(WaylandObject):
         """
         self.display.out_queue.append((self.pack_arguments(2), ()))
 
+    def unpack_event(self, op, data, fds):
+        if op == 1:
+            return struct.unpack("II", data)
+        elif op == 2:
+            return struct.unpack("III", data)
+        elif op == 3:
+            return ()
+        return super().unpack_event(op, data, fds)[2]
+
+    def destroy(self):
+        pass
+
     events = ['pong', 'move', 'resize', 'set_toplevel', 'set_transient', 'set_fullscreen', 'set_popup', 'set_maximized', 'set_title', 'set_class']
     requests = ['ping', 'configure', 'popup_done']
 
@@ -1275,7 +1420,7 @@ class Surface(WaylandObject):
         Deletes the surface and invalidates its object ID.
         
         """
-        pass
+        raise NotImplementedError("Surface: Destroy")
 
     def handle_attach(self, buffer, x, y):
         """ set the surface contents
@@ -1321,7 +1466,7 @@ class Surface(WaylandObject):
         following wl_surface.commit will remove the surface content.
         
         """
-        pass
+        raise NotImplementedError("Surface: Attach")
 
     def handle_damage(self, x, y, width, height):
         """ mark part of the surface damaged
@@ -1349,7 +1494,7 @@ class Surface(WaylandObject):
         and is probably the preferred and intuitive way of doing this.
         
         """
-        pass
+        raise NotImplementedError("Surface: Damage")
 
     def handle_frame(self, callback):
         """ request a frame throttling hint
@@ -1388,7 +1533,7 @@ class Surface(WaylandObject):
         milliseconds, with an undefined base.
         
         """
-        pass
+        raise NotImplementedError("Surface: Frame")
 
     def handle_set_opaque_region(self, region):
         """ set opaque region
@@ -1419,7 +1564,7 @@ class Surface(WaylandObject):
         region to be set to empty.
         
         """
-        pass
+        raise NotImplementedError("Surface: Set Opaque Region")
 
     def handle_set_input_region(self, region):
         """ set input region
@@ -1448,7 +1593,7 @@ class Surface(WaylandObject):
         to infinite.
         
         """
-        pass
+        raise NotImplementedError("Surface: Set Input Region")
 
     def handle_commit(self):
         """ commit pending surface state
@@ -1472,7 +1617,7 @@ class Surface(WaylandObject):
         Other interfaces may add further double-buffered surface state.
         
         """
-        pass
+        raise NotImplementedError("Surface: Commit")
 
     def send_enter(self, output):
         """ surface enters an output
@@ -1530,7 +1675,7 @@ class Surface(WaylandObject):
         is raised.
         
         """
-        pass
+        raise NotImplementedError("Surface: Set Buffer Transform")
 
     def handle_set_buffer_scale(self, scale):
         """ sets the buffer scaling factor
@@ -1560,7 +1705,7 @@ class Surface(WaylandObject):
         raised.
         
         """
-        pass
+        raise NotImplementedError("Surface: Set Buffer Scale")
 
     def handle_damage_buffer(self, x, y, width, height):
         """ mark part of the surface damaged using buffer coordinates
@@ -1599,19 +1744,38 @@ class Surface(WaylandObject):
         after receiving the wl_surface.commit.
         
         """
-        pass
+        raise NotImplementedError("Surface: Damage Buffer")
+
+    def unpack_event(self, op, data, fds):
+        if op == 1:
+            return struct.unpack("III", data)
+        elif op == 2:
+            return struct.unpack("IIII", data)
+        elif op == 3:
+            return struct.unpack("I", data)
+        elif op == 6:
+            return ()
+        return super().unpack_event(op, data, fds)[2]
+
+    def destroy(self):
+        self.handle_destroy()
 
     events = ['destroy', 'attach', 'damage', 'frame', 'set_opaque_region', 'set_input_region', 'commit', 'set_buffer_transform', 'set_buffer_scale', 'damage_buffer']
     requests = ['enter', 'leave']
 
 
-class Seat(WaylandObject):
+class SeatProxy(WaylandObject):
     version = 6
 
     # seat capability bitmask
     POINTER = 1
     KEYBOARD = 2
     TOUCH = 4
+
+    def __init__(self, display, obj_id, seat):
+        super().__init__(display, obj_id)
+        self.seat = seat
+        self.seat.setup(self)
 
     def send_capabilities(self, capabilities):
         """ seat capabilities changed
@@ -1656,7 +1820,7 @@ class Seat(WaylandObject):
         never had the pointer capability.
         
         """
-        pass
+        self.seat.get_pointer(self, id)
 
     def handle_get_keyboard(self, id):
         """ return keyboard object
@@ -1670,7 +1834,7 @@ class Seat(WaylandObject):
         never had the keyboard capability.
         
         """
-        pass
+        self.seat.get_keyboard(self, id)
 
     def handle_get_touch(self, id):
         """ return touch object
@@ -1684,7 +1848,7 @@ class Seat(WaylandObject):
         never had the touch capability.
         
         """
-        pass
+        self.seat.get_touch(self, id)
 
     def send_name(self, name):
         """ unique identifier for this seat
@@ -1703,7 +1867,16 @@ class Seat(WaylandObject):
         use the seat object anymore.
         
         """
-        pass
+        self.seat.release(self)
+
+    def unpack_event(self, op, data, fds):
+        if op != 3:
+            return struct.unpack("I", data)
+        else:
+            return ()
+
+    def destroy(self):
+        self.seat.destroy(self)
 
     events = ['get_pointer', 'get_keyboard', 'get_touch', 'release']
     requests = ['capabilities', 'name']
@@ -1748,7 +1921,7 @@ class Pointer(WaylandObject):
         undefined, and the wl_surface is unmapped.
         
         """
-        pass
+        raise NotImplementedError("Pointer: Set Cursor")
 
     def send_enter(self, serial, surface, surface_x, surface_y):
         """ enter event
@@ -1847,7 +2020,7 @@ class Pointer(WaylandObject):
         wl_pointer_destroy() after using this request.
         
         """
-        pass
+        raise NotImplementedError("Pointer: Release")
 
     def send_frame(self):
         """ end of a pointer event sequence
@@ -1982,6 +2155,12 @@ class Pointer(WaylandObject):
         """
         self.display.out_queue.append((self.pack_arguments(8, axis, discrete), ()))
 
+    def unpack_event(self, op, data, fds):
+        return super().unpack_event(op, data, fds)[2]
+
+    def destroy(self):
+        self.handle_release()
+
     events = ['set_cursor', 'release']
     requests = ['enter', 'leave', 'motion', 'button', 'axis', 'frame', 'axis_source', 'axis_stop', 'axis_discrete']
 
@@ -2047,7 +2226,7 @@ class Keyboard(WaylandObject):
 
     def handle_release(self):
         """ release the keyboard object"""
-        pass
+        raise NotImplementedError("Keyboard: Release")
 
     def send_repeat_info(self, rate, delay):
         """ repeat rate and delay
@@ -2067,6 +2246,12 @@ class Keyboard(WaylandObject):
         
         """
         self.display.out_queue.append((self.pack_arguments(5, rate, delay), ()))
+
+    def unpack_event(self, op, data, fds):
+        return super().unpack_event(op, data, fds)[2]
+
+    def destroy(self):
+        self.handle_release()
 
     events = ['release']
     requests = ['keymap', 'enter', 'leave', 'key', 'modifiers', 'repeat_info']
@@ -2133,7 +2318,7 @@ class Touch(WaylandObject):
 
     def handle_release(self):
         """ release the touch object"""
-        pass
+        raise NotImplementedError("Touch: Release")
 
     def send_shape(self, id, major, minor):
         """ update shape of touch point
@@ -2197,11 +2382,17 @@ class Touch(WaylandObject):
         """
         self.display.out_queue.append((self.pack_arguments(6, id, orientation), ()))
 
+    def unpack_event(self, op, data, fds):
+        return super().unpack_event(op, data, fds)[2]
+
+    def destroy(self):
+        self.handle_release()
+
     events = ['release']
     requests = ['down', 'up', 'motion', 'frame', 'cancel', 'shape', 'orientation']
 
 
-class Output(WaylandObject):
+class OutputProxy(WaylandObject):
     version = 3
 
     # subpixel geometry information
@@ -2221,6 +2412,11 @@ class Output(WaylandObject):
     FLIPPED_90 = 5
     FLIPPED_180 = 6
     FLIPPED_270 = 7
+
+    def __init__(self, display, obj_id, output):
+        super().__init__(display, obj_id)
+        self.output = output
+        self.output.setup(self)
 
     def send_geometry(self, x, y, physical_width, physical_height, subpixel, make, model, transform):
         """ properties of the output
@@ -2300,7 +2496,13 @@ class Output(WaylandObject):
         use the output object anymore.
         
         """
-        pass
+        self.output.release(self)
+
+    def unpack_event(self, op, data, fds):
+        return super().unpack_event(op, data, fds)[2]
+
+    def destroy(self):
+        self.output.destroy(self)
 
     events = ['release']
     requests = ['geometry', 'mode', 'done', 'scale']
@@ -2314,7 +2516,7 @@ class Region(WaylandObject):
         Destroy the region.  This will invalidate the object ID.
         
         """
-        pass
+        raise NotImplementedError("Region: Destroy")
 
     def handle_add(self, x, y, width, height):
         """ add rectangle to region
@@ -2322,7 +2524,7 @@ class Region(WaylandObject):
         Add the specified rectangle to the region.
         
         """
-        pass
+        raise NotImplementedError("Region: Add")
 
     def handle_subtract(self, x, y, width, height):
         """ subtract rectangle from region
@@ -2330,14 +2532,25 @@ class Region(WaylandObject):
         Subtract the specified rectangle from the region.
         
         """
-        pass
+        raise NotImplementedError("Region: Subtract")
+
+    def unpack_event(self, op, data, fds):
+        return super().unpack_event(op, data, fds)[2]
+
+    def destroy(self):
+        self.handle_destroy()
 
     events = ['destroy', 'add', 'subtract']
     requests = []
 
 
-class Subcompositor(WaylandObject):
+class SubcompositorProxy(WaylandObject):
     version = 1
+
+    def __init__(self, display, obj_id, subcompositor):
+        super().__init__(display, obj_id)
+        self.subcompositor = subcompositor
+        self.subcompositor.setup(self)
 
     def handle_destroy(self):
         """ unbind from the subcompositor interface
@@ -2347,7 +2560,8 @@ class Subcompositor(WaylandObject):
         objects, wl_subsurface objects included.
         
         """
-        pass
+        self.subcompositor.destroy(self)
+
     BAD_SURFACE = 0
 
     def handle_get_subsurface(self, id, surface, parent):
@@ -2362,7 +2576,13 @@ class Subcompositor(WaylandObject):
         error is raised.
         
         """
-        pass
+        self.subcompositor.get_subsurface(self, id, surface, parent)
+
+    def unpack_event(self, op, data, fds):
+        return super().unpack_event(op, data, fds)[2]
+
+    def destroy(self):
+        self.handle_destroy()
 
     events = ['destroy', 'get_subsurface']
     requests = []
@@ -2380,7 +2600,7 @@ class Subsurface(WaylandObject):
         a sub-surface. The wl_surface is unmapped.
         
         """
-        pass
+        raise NotImplementedError("Subsurface: Destroy")
     BAD_SURFACE = 0
 
     def handle_set_position(self, x, y):
@@ -2404,7 +2624,7 @@ class Subsurface(WaylandObject):
         The initial position is 0, 0.
         
         """
-        pass
+        raise NotImplementedError("Subsurface: Set Position")
 
     def handle_place_above(self, sibling):
         """ restack the sub-surface
@@ -2426,7 +2646,7 @@ class Subsurface(WaylandObject):
         of its siblings and parent.
         
         """
-        pass
+        raise NotImplementedError("Subsurface: Set Above")
 
     def handle_place_below(self, sibling):
         """ restack the sub-surface
@@ -2435,7 +2655,7 @@ class Subsurface(WaylandObject):
         See wl_subsurface.place_above.
         
         """
-        pass
+        raise NotImplementedError("Subsurface: Place Below")
 
     def handle_set_sync(self):
         """ set sub-surface to synchronized mode
@@ -2455,7 +2675,7 @@ class Subsurface(WaylandObject):
         See wl_subsurface for the recursive effect of this mode.
         
         """
-        pass
+        raise NotImplementedError("Surbsurface: Set Sync")
 
     def handle_set_desync(self):
         """ set sub-surface to desynchronized mode
@@ -2481,7 +2701,13 @@ class Subsurface(WaylandObject):
         the cached state is applied on set_desync.
         
         """
-        pass
+        raise NotImplementedError("Subsurface: Set Desync")
+
+    def unpack_event(self, op, data, fds):
+        return super().unpack_event(op, data, fds)[2]
+
+    def destroy(self):
+        self.handle_destroy()
 
     events = ['destroy', 'set_position', 'place_above', 'place_below', 'set_sync', 'set_desync']
     requests = []

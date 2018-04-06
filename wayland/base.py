@@ -26,6 +26,8 @@ class WaylandObject(object):
                     message += b"\x00"
             elif argument is None:
                 message += b"\x00\x00\x00\x00"
+            elif isinstance(argument, (list, tuple)):
+                message += struct.pack("I"+"i"*len(argument), len(argument)*4, *argument)
         length = (len(message) + 8) << 16
         return struct.pack("II", self.obj_id, length + opcode) + message
 
